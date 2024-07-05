@@ -37,6 +37,10 @@ mod bus;
 #[doc(hidden)]
 pub static NOTIFICATION_DEFAULT_BUS: &str = "org.freedesktop.Notifications";
 
+#[cfg(not(feature = "debug_namespace"))]
+#[doc(hidden)]
+pub static NOTIFICATION_PORTAL_BUS: &str = "org.freedesktop.portal.Desktop";
+
 #[cfg(feature = "debug_namespace")]
 #[doc(hidden)]
 // #[deprecated]
@@ -46,7 +50,13 @@ pub static NOTIFICATION_DEFAULT_BUS: &str = "de.hoodie.Notifications";
 pub static NOTIFICATION_INTERFACE: &str = "org.freedesktop.Notifications";
 
 #[doc(hidden)]
+pub static NOTIFICATION_PORTAL_INTERFACE: &str = "org.freedesktop.portal.Notification";
+
+#[doc(hidden)]
 pub static NOTIFICATION_OBJECTPATH: &str = "/org/freedesktop/Notifications";
+
+#[doc(hidden)]
+pub static NOTIFICATION_PORTAL_OBJECTPATH: &str = "/org/freedesktop/portal/desktop";
 
 pub(crate) use bus::NotificationBus;
 

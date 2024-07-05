@@ -1,4 +1,4 @@
-use crate::xdg::NOTIFICATION_DEFAULT_BUS;
+use crate::xdg::{NOTIFICATION_DEFAULT_BUS, NOTIFICATION_PORTAL_BUS};
 
 fn skip_first_slash(s: &str) -> &str {
     if let Some('/') = s.chars().next() {
@@ -8,7 +8,7 @@ fn skip_first_slash(s: &str) -> &str {
     }
 }
 
-use std::path::PathBuf;
+use std::{fmt, path::PathBuf};
 
 type BusNameType = std::borrow::Cow<'static, str>;
 
@@ -37,6 +37,13 @@ impl Default for NotificationBus {
     }
 }
 
+#[cfg(all(feature = "dbus", not(feature = "zbus")))]
+impl fmt::Display for NotificationBus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 impl NotificationBus {
     fn namespaced_custom(custom_path: &str) -> Option<String> {
         // abusing path for semantic join
@@ -47,6 +54,11 @@ impl NotificationBus {
         )
         .replace('/', ".")
         .into()
+    }
+
+    #[cfg(feature = "zbus")]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
     }
 
     #[cfg(feature = "zbus")]
@@ -64,5 +76,25 @@ impl NotificationBus {
 
     pub fn into_name(self) -> BusNameType {
         self.0
+    }
+
+    #[cfg(feature = "zbus")]
+    pub fn portal() -> Self {
+        Self(
+            zbus::names::WellKnownName::from_static_str(NOTIFICATION_PORTAL_BUS)
+                .unwrap()
+                .to_string()
+                .into(),
+        )
+    }
+
+    #[cfg(all(feature = "dbus", not(feature = "zbus")))]
+    pub fn portal() -> Self {
+        Self(
+            dbus::strings::BusName::from_slice(NOTIFICATION_PORTAL_BUS)
+                .unwrap()
+                .to_string()
+                .into(),
+        )
     }
 }

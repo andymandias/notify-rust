@@ -69,7 +69,7 @@ impl From<u64> for Urgency {
         match int {
             0 => Urgency::Low,
             1 => Urgency::Normal,
-            2..=std::u64::MAX => Urgency::Critical,
+            2..=u64::MAX => Urgency::Critical,
         }
     }
 }
@@ -81,7 +81,7 @@ impl From<u8> for Urgency {
         match int {
             0 => Urgency::Low,
             1 => Urgency::Normal,
-            2..=std::u8::MAX => Urgency::Critical,
+            2..=u8::MAX => Urgency::Critical,
         }
     }
 }

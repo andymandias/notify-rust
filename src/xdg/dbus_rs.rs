@@ -1,24 +1,39 @@
 use dbus::{
-    arg::messageitem::{MessageItem, MessageItemArray},
+    arg::{
+        messageitem::{MessageItem, MessageItemArray},
+        RefArg, Variant,
+    },
+    blocking::stdintf::org_freedesktop_dbus::Properties,
     ffidisp::{BusType, Connection, ConnectionItem},
     Message,
 };
 
 use super::{
     bus::NotificationBus, ActionResponse, ActionResponseHandler, CloseReason,
-    NOTIFICATION_INTERFACE,
+    NOTIFICATION_INTERFACE, NOTIFICATION_PORTAL_INTERFACE,
 };
 
 use crate::{
     error::*,
-    hints::message::HintMessage,
+    hints::{message::HintMessage, Hint},
     notification::Notification,
-    xdg::{ServerInformation, NOTIFICATION_OBJECTPATH},
+    urgency::Urgency,
+    xdg::{
+        ServerInformation, NOTIFICATION_OBJECTPATH, NOTIFICATION_PORTAL_BUS,
+        NOTIFICATION_PORTAL_OBJECTPATH,
+    },
+};
+
+use std::{
+    collections::HashMap,
+    fs,
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 pub mod bus {
 
-    use crate::xdg::NOTIFICATION_DEFAULT_BUS;
+    use crate::xdg::{NOTIFICATION_DEFAULT_BUS, NOTIFICATION_PORTAL_BUS};
+    use std::fmt;
 
     fn skip_first_slash(s: &str) -> &str {
         if let Some('/') = s.chars().next() {
@@ -41,6 +56,12 @@ pub mod bus {
         }
     }
 
+    impl fmt::Display for NotificationBus {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}", self.0)
+        }
+    }
+
     impl NotificationBus {
         fn namespaced_custom(custom_path: &str) -> Option<String> {
             // abusing path for semantic join
@@ -56,6 +77,10 @@ pub mod bus {
         pub fn custom(custom_path: &str) -> Option<Self> {
             let name = dbus::strings::BusName::new(Self::namespaced_custom(custom_path)?).ok()?;
             Some(Self(name))
+        }
+
+        pub fn portal() -> Self {
+            Self(dbus::strings::BusName::from_slice(NOTIFICATION_PORTAL_BUS).unwrap())
         }
 
         pub fn into_name(self) -> BusNameType {
@@ -92,7 +117,7 @@ impl DbusNotificationHandle {
     }
 
     pub fn close(self) {
-        let mut message = build_message("CloseNotification", Default::default());
+        let mut message = build_message("CloseNotification", self.notification.bus.clone());
         message.append_items(&[self.id.into()]);
         let _ = self.connection.send(message); // If closing fails there's nothing we could do anyway
     }
@@ -119,7 +144,13 @@ pub fn send_notification_via_connection(
     id: u32,
     connection: &Connection,
 ) -> Result<u32> {
-    send_notification_via_connection_at_bus(notification, id, connection, Default::default())
+    let bus = if get_portal_version_via_connection(connection).is_ok_and(|version| version > 0) {
+        NotificationBus::portal()
+    } else {
+        NotificationBus::default()
+    };
+
+    send_notification_via_connection_at_bus(notification, id, connection, bus)
 }
 
 pub fn send_notification_via_connection_at_bus(
@@ -128,56 +159,127 @@ pub fn send_notification_via_connection_at_bus(
     connection: &Connection,
     bus: NotificationBus,
 ) -> Result<u32> {
-    let mut message = build_message("Notify", bus);
-    let timeout: i32 = notification.timeout.into();
-    message.append_items(&[
-        notification.appname.to_owned().into(), // appname
-        id.into(),                              // notification to update
-        notification.icon.to_owned().into(),    // icon
-        notification.summary.to_owned().into(), // summary (title)
-        notification.body.to_owned().into(),    // body
-        pack_actions(notification),             // actions
-        pack_hints(notification)?,              // hints
-        timeout.into(),                         // timeout
-    ]);
+    if bus.to_string() == NOTIFICATION_PORTAL_BUS {
+        static APP_ID: AtomicU32 = AtomicU32::new(1);
 
-    let reply = connection.send_with_reply_and_block(message, 2000)?;
+        let id = if id == 0 {
+            APP_ID.fetch_add(1, Ordering::Relaxed)
+        } else {
+            id
+        };
 
-    match reply.get_items().first() {
-        Some(MessageItem::UInt32(ref id)) => Ok(*id),
-        _ => Ok(0),
+        let mut dict = HashMap::<&str, Variant<Box<dyn RefArg>>>::new();
+
+        dict.insert("title", Variant(Box::new(notification.summary.clone())));
+
+        dict.insert("body", Variant(Box::new(notification.body.clone())));
+
+        dict.insert(
+            "priority",
+            Variant(Box::new(
+                if let Some(Hint::Urgency(urgency)) = notification
+                    .get_hints()
+                    .find(|hint| matches!(hint, Hint::Urgency(_)))
+                {
+                    match urgency {
+                        Urgency::Low => "low",
+                        Urgency::Normal => "normal",
+                        Urgency::Critical => "urgent",
+                    }
+                } else {
+                    "normal"
+                }
+                .to_string(),
+            )),
+        );
+
+        if !notification.icon.is_empty() {
+            dict.insert(
+                "icon",
+                Variant(Box::new((
+                    "themed".to_string(),
+                    Variant(vec![notification.icon.clone()]),
+                ))),
+            );
+        } else if let Some(Hint::ImagePath(image_path)) = notification
+            .get_hints()
+            .find(|hint| matches!(hint, Hint::ImagePath(_)))
+        {
+            if let Ok(image_data) = fs::read(image_path) {
+                dict.insert(
+                    "icon",
+                    Variant(Box::new(("bytes".to_string(), Variant(image_data)))),
+                );
+            }
+        }
+
+        let message = build_message("AddNotification", bus).append2(id.to_string().as_str(), dict);
+
+        let _ = connection.send_with_reply_and_block(message, 2000)?;
+
+        Ok(id)
+    } else {
+        let mut message = build_message("Notify", bus);
+        let timeout: i32 = notification.timeout.into();
+        message.append_items(&[
+            notification.appname.to_owned().into(), // appname
+            id.into(),                              // notification to update
+            notification.icon.to_owned().into(),    // icon
+            notification.summary.to_owned().into(), // summary (title)
+            notification.body.to_owned().into(),    // body
+            pack_actions(notification),             // actions
+            pack_hints(notification)?,              // hints
+            timeout.into(),                         // timeout
+        ]);
+
+        let reply = connection.send_with_reply_and_block(message, 2000)?;
+
+        match reply.get_items().first() {
+            Some(MessageItem::UInt32(ref id)) => Ok(*id),
+            _ => Ok(0),
+        }
     }
 }
 
 pub fn connect_and_send_notification(
     notification: &Notification,
 ) -> Result<DbusNotificationHandle> {
-    let bus = notification.bus.clone();
-    connect_and_send_notification_at_bus(notification, bus)
-}
-
-pub fn connect_and_send_notification_at_bus(
-    notification: &Notification,
-    bus: NotificationBus,
-) -> Result<DbusNotificationHandle> {
     let connection = Connection::get_private(BusType::Session)?;
     let inner_id = notification.id.unwrap_or(0);
-    let id = send_notification_via_connection_at_bus(notification, inner_id, &connection, bus)?;
+    let bus = if get_portal_version_via_connection(&connection).is_ok_and(|version| version > 0) {
+        NotificationBus::portal()
+    } else {
+        NotificationBus::default()
+    };
+    let id =
+        send_notification_via_connection_at_bus(notification, inner_id, &connection, bus.clone())?;
 
     Ok(DbusNotificationHandle::new(
         id,
         connection,
-        notification.clone(),
+        Notification {
+            bus,
+            ..notification.clone()
+        },
     ))
 }
 
 fn build_message(method_name: &str, bus: NotificationBus) -> Message {
-    Message::new_method_call(
-        bus.into_name(),
-        NOTIFICATION_OBJECTPATH,
-        NOTIFICATION_INTERFACE,
-        method_name,
-    )
+    if bus.to_string() == NOTIFICATION_PORTAL_BUS {
+        Message::new_method_call(
+            bus.into_name(),
+            NOTIFICATION_PORTAL_OBJECTPATH,
+            NOTIFICATION_PORTAL_INTERFACE,
+            method_name,
+        )
+    } else {
+        Message::new_method_call(
+            bus.into_name(),
+            NOTIFICATION_OBJECTPATH,
+            NOTIFICATION_INTERFACE,
+            method_name,
+        )
+    }
     .unwrap_or_else(|_| panic!("Error building message call {:?}.", method_name))
 }
 
@@ -229,6 +331,17 @@ pub fn get_capabilities() -> Result<Vec<String>> {
     }
 
     Ok(capabilities)
+}
+
+pub fn get_portal_version_via_connection(connection: &Connection) -> Result<u32> {
+    let proxy = dbus::blocking::Proxy::new(
+        NOTIFICATION_PORTAL_BUS,
+        NOTIFICATION_PORTAL_OBJECTPATH,
+        core::time::Duration::from_millis(2000),
+        connection,
+    );
+    let version = proxy.get::<u32>(NOTIFICATION_PORTAL_INTERFACE, "version")?;
+    Ok(version)
 }
 
 fn unwrap_message_string(item: Option<&MessageItem>) -> String {

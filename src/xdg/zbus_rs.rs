@@ -1,11 +1,12 @@
-use crate::{error::*, notification::Notification, xdg};
-use zbus::{export::futures_util::TryStreamExt, MatchRule};
+use crate::{error::*, hints::Hint, notification::Notification, urgency::Urgency, xdg};
+use zbus::{export::futures_util::TryStreamExt, zvariant, MatchRule};
+use std::{collections::HashMap, fs, sync::atomic::{AtomicU32, Ordering}};
 
 use super::{bus::NotificationBus, ActionResponse, ActionResponseHandler, CloseReason};
 
 pub mod bus {
 
-    use crate::xdg::NOTIFICATION_DEFAULT_BUS;
+    use crate::xdg::{NOTIFICATION_DEFAULT_BUS, NOTIFICATION_PORTAL_BUS};
 
     fn skip_first_slash(s: &str) -> &str {
         if let Some('/') = s.chars().next() {
@@ -41,6 +42,10 @@ pub mod bus {
             .into()
         }
 
+        pub fn as_str(&self) -> &str {
+            self.0.as_str()
+        }
+
         pub fn custom(custom_path: &str) -> Option<Self> {
             let name =
                 zbus::names::WellKnownName::try_from(Self::namespaced_custom(custom_path)?).ok()?;
@@ -49,6 +54,10 @@ pub mod bus {
 
         pub fn into_name(self) -> BusNameType {
             self.0
+        }
+
+        pub fn portal() -> Self {
+            Self(zbus::names::WellKnownName::from_static_str(NOTIFICATION_PORTAL_BUS).unwrap())
         }
     }
 }
@@ -127,7 +136,18 @@ async fn send_notification_via_connection(
     id: u32,
     connection: &zbus::Connection,
 ) -> Result<u32> {
-    send_notification_via_connection_at_bus(notification, id, connection, Default::default()).await
+    let bus = if get_portal_version_via_connection(connection).await.is_ok_and(|version| version > 0) {
+        NotificationBus::portal()
+    } else {
+        NotificationBus::default()
+    };
+
+    send_notification_via_connection_at_bus(
+        notification,
+        id,
+        connection,
+        bus,
+    ).await
 }
 
 async fn send_notification_via_connection_at_bus(
@@ -136,34 +156,107 @@ async fn send_notification_via_connection_at_bus(
     connection: &zbus::Connection,
     bus: NotificationBus,
 ) -> Result<u32> {
-    let reply: u32 = connection
-        .call_method(
-            Some(bus.into_name()),
-            xdg::NOTIFICATION_OBJECTPATH,
-            Some(xdg::NOTIFICATION_INTERFACE),
-            "Notify",
-            &(
-                &notification.appname,
-                id,
-                &notification.icon,
-                &notification.summary,
-                &notification.body,
-                &notification.actions,
-                crate::hints::hints_to_map(notification),
-                i32::from(notification.timeout),
-            ),
-        )
-        .await?
-        .body()
-        .deserialize()?;
-    Ok(reply)
+    if bus.as_str() == xdg::NOTIFICATION_PORTAL_BUS {
+        static APP_ID: AtomicU32 = AtomicU32::new(1);
+
+        let id = if id == 0 {
+            APP_ID.fetch_add(1, Ordering::Relaxed)
+        } else {
+            id
+        };
+
+        let mut dict = HashMap::<&str, &zvariant::Value>::new();
+
+        let title_variant = zvariant::Value::from(&notification.summary);
+        dict.insert("title", &title_variant);
+
+        let body_variant = zvariant::Value::from(&notification.body);
+        dict.insert("body", &body_variant);
+
+        let priority_variant = zvariant::Value::from(
+            if let Some(Hint::Urgency(urgency)) = notification
+                .get_hints()
+                .find(|hint| matches!(hint, Hint::Urgency(_)))
+            {
+                match urgency {
+                    Urgency::Low => "low",
+                    Urgency::Normal => "normal",
+                    Urgency::Critical => "urgent",
+                }
+            } else {
+                "normal"
+            },
+        );
+        dict.insert("priority", &priority_variant);
+
+        let mut icon_variant = zvariant::Value::from(("themed", zvariant::Value::from(vec![&notification.icon])));
+        if notification.icon.is_empty() {
+            if let Some(Hint::ImagePath(image_path)) = notification.get_hints().find(|hint| matches!(hint, Hint::ImagePath(_))) {
+                if let Ok(image_data) = fs::read(image_path) {
+                    icon_variant = zvariant::Value::from(("bytes", zvariant::Value::from(image_data)));
+                }
+            }
+        }
+        dict.insert("icon", &icon_variant);
+
+        let _ = connection
+            .call_method(
+                Some(bus.into_name()),
+                xdg::NOTIFICATION_PORTAL_OBJECTPATH,
+                Some(xdg::NOTIFICATION_PORTAL_INTERFACE),
+                "AddNotification",
+                &(
+                    id.to_string(),
+                    dict,
+                ),
+            )
+            .await?;
+        Ok(id)
+    } else {
+        let reply: u32 = connection
+            .call_method(
+                Some(bus.into_name()),
+                xdg::NOTIFICATION_OBJECTPATH,
+                Some(xdg::NOTIFICATION_INTERFACE),
+                "Notify",
+                &(
+                    &notification.appname,
+                    id,
+                    &notification.icon,
+                    &notification.summary,
+                    &notification.body,
+                    &notification.actions,
+                    crate::hints::hints_to_map(notification),
+                    i32::from(notification.timeout),
+                ),
+            )
+            .await?
+            .body()
+            .deserialize()?;
+        Ok(reply)
+    }
 }
 
 pub async fn connect_and_send_notification(
     notification: &Notification,
 ) -> Result<ZbusNotificationHandle> {
-    let bus = notification.bus.clone();
-    connect_and_send_notification_at_bus(notification, bus).await
+    let connection = zbus::Connection::session().await?;
+    let inner_id = notification.id.unwrap_or(0);
+    let bus = if get_portal_version_via_connection(&connection).await.is_ok_and(|version| version > 0) {
+        NotificationBus::portal()
+    } else {
+        NotificationBus::default()
+    };
+    let id = send_notification_via_connection_at_bus(notification, inner_id, &connection, bus.clone()).await?;
+
+    Ok(ZbusNotificationHandle::new(
+        id,
+        connection,
+        Notification {
+            bus,
+            ..notification.clone()
+        },
+    ))
 }
 
 pub(crate) async fn connect_and_send_notification_at_bus(
@@ -172,8 +265,7 @@ pub(crate) async fn connect_and_send_notification_at_bus(
 ) -> Result<ZbusNotificationHandle> {
     let connection = zbus::Connection::session().await?;
     let inner_id = notification.id.unwrap_or(0);
-    let id =
-        send_notification_via_connection_at_bus(notification, inner_id, &connection, bus).await?;
+    let id = send_notification_via_connection_at_bus(notification, inner_id, &connection, bus).await?;
 
     Ok(ZbusNotificationHandle::new(
         id,
@@ -200,6 +292,17 @@ pub async fn get_capabilities_at_bus(bus: NotificationBus) -> Result<Vec<String>
 
 pub async fn get_capabilities() -> Result<Vec<String>> {
     get_capabilities_at_bus(Default::default()).await
+}
+
+pub async fn get_portal_version_via_connection(connection: &zbus::Connection) -> Result<u32> {
+    let proxy = zbus::Proxy::new(
+        connection,
+        xdg::NOTIFICATION_PORTAL_BUS,
+        xdg::NOTIFICATION_PORTAL_OBJECTPATH,
+        xdg::NOTIFICATION_PORTAL_INTERFACE,
+    ).await?;
+    let version = proxy.get_property::<u32>("version").await?;
+    Ok(version)
 }
 
 pub async fn get_server_information_at_bus(bus: NotificationBus) -> Result<xdg::ServerInformation> {
